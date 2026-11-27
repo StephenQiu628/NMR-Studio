@@ -13,56 +13,33 @@ struct PlotPalette {
 
     init(dark: Bool, highContrast: Bool, forPDF: Bool) {
         if forPDF {
-            // The independent PDF renderer must not inherit the window appearance.
+            // The independent export renderer must never inherit the window theme.
             background = Self.rgb(0xFFFFFF)
-            trace = Self.rgb(0x006D73)
-            text = Self.rgb(0x171C1E)
-            axis = Self.rgb(0x20282A)
-            grid = Self.rgb(highContrast ? 0x899497 : 0xD9E0E2)
-            peak = Self.rgb(0x80320C)
-            integral = Self.rgb(0x493978)
-            selection = Self.rgb(0x224B75)
+            trace = Self.rgb(0x00656D)
+            text = Self.rgb(0x17314A)
+            axis = Self.rgb(0x263E50)
+            grid = Self.rgb(highContrast ? 0x98AAB6 : 0xDCE5EB)
+            peak = Self.rgb(0x263E50)
+            integral = Self.rgb(0x00656D)
+            selection = Self.rgb(0x007E86)
             return
         }
 
-        let appearance: NSAppearance.Name
-        if dark {
-            appearance = highContrast ? .accessibilityHighContrastDarkAqua : .darkAqua
-        } else {
-            appearance = highContrast ? .accessibilityHighContrastAqua : .aqua
-        }
-        let label = Self.resolved(.labelColor, appearance: appearance,
-                                  fallback: dark ? 0xF1F3F4 : 0x212527)
-        background = Self.rgb(dark ? 0x191C1E : 0xFFFFFF)
-        trace = Self.rgb(dark ? 0x71DBD4 : 0x006D73)
-        text = label
-        axis = label
+        background = Self.rgb(dark ? 0x111D26 : 0xFFFFFF)
+        text = Self.rgb(dark ? 0xEDF5FA : 0x17314A)
+        trace = Self.rgb(dark ? (highContrast ? 0x8CEBE8 : 0x41D5D4)
+                                    : (highContrast ? 0x005C63 : 0x007E86))
+        axis = Self.rgb(dark ? (highContrast ? 0xEDF5FA : 0xAABCC8)
+                                   : (highContrast ? 0x17314A : 0x526575))
+        peak = Self.rgb(dark ? 0xEDF5FA : 0x263E50)
+        integral = Self.rgb(dark ? (highContrast ? 0x8CEBE8 : 0x41D5D4)
+                                       : (highContrast ? 0x005C63 : 0x007E86))
+        selection = Self.rgb(dark ? 0x41D5D4 : 0x007E86)
         if highContrast {
-            grid = Self.rgb(dark ? 0x718085 : 0x899497)
+            grid = Self.rgb(dark ? 0x526575 : 0x98AAB6)
         } else {
-            grid = Self.resolved(.separatorColor, appearance: appearance,
-                                 fallback: dark ? 0x3B4245 : 0xDADFE1)
+            grid = Self.rgb(dark ? 0x304451 : 0xCCD8E1).withAlphaComponent(0.55)
         }
-        if dark {
-            peak = Self.rgb(highContrast ? 0xFFD0AA : 0xFFAD80)
-            integral = Self.rgb(highContrast ? 0xE7DCFF : 0xC8BCFF)
-            selection = Self.rgb(highContrast ? 0xE8F4FF : 0xA8D5FF)
-        } else {
-            peak = Self.rgb(highContrast ? 0x74290B : 0x90390F)
-            integral = Self.rgb(highContrast ? 0x392665 : 0x534186)
-            selection = Self.rgb(highContrast ? 0x173D65 : 0x24527E)
-        }
-    }
-
-    private static func resolved(_ color: NSColor, appearance name: NSAppearance.Name,
-                                 fallback: UInt32) -> NSColor {
-        var result: NSColor?
-        if let appearance = NSAppearance(named: name) {
-            appearance.performAsCurrentDrawingAppearance {
-                result = color.usingColorSpace(.sRGB)
-            }
-        }
-        return result ?? rgb(fallback)
     }
 
     private static func rgb(_ hex: UInt32) -> NSColor {

@@ -9,12 +9,14 @@ struct PlotRegions {
 
     init(size: CGSize, field r: CGRect) {
         let h = max(0, size.height)
-        let headerHeight = min(23, max(0, h - r.maxY))
+        let headerHeight = min(28, max(0, h - r.maxY))
         header = CGRect(x: r.minX, y: h - headerHeight, width: r.width, height: headerHeight)
         let peakBottom = r.maxY + 1
         peakStrip = CGRect(x: r.minX, y: peakBottom, width: r.width,
                            height: max(0, header.minY - 2 - peakBottom))
-        axisY = min(41, floor(r.minY * 0.55))
+        // Room for 16 pt ticks and a separate 17 pt axis title. The data
+        // field and its shared ppm/reference mapping are unchanged.
+        axisY = min(54, floor(r.minY * 0.65))
         let bottom = axisY + 6
         gutter = CGRect(x: r.minX, y: bottom, width: r.width,
                         height: max(0, r.minY - 3 - bottom))
@@ -81,16 +83,10 @@ enum PlotInk {
         return String(format: "%.*f", locale: Locale.current, digits, abs(value) < zero ? 0.0 : value)
     }
 
-    // Local to plot annotations; does not change the palette of other controls.
+    // Retain the existing helper name for callers; integral ink now follows
+    // the same cyan/teal palette as the plot rather than a separate green.
     static func integralGreen(dark: Bool, contrast: Bool) -> NSColor {
-        if dark {
-            return contrast
-                ? NSColor(srgbRed: 0.72, green: 1, blue: 0.78, alpha: 1)
-                : NSColor(srgbRed: 0.51, green: 0.88, blue: 0.61, alpha: 1)
-        }
-        return contrast
-            ? NSColor(srgbRed: 0.02, green: 0.30, blue: 0.13, alpha: 1)
-            : NSColor(srgbRed: 0.06, green: 0.39, blue: 0.19, alpha: 1)
+        PlotPalette(dark: dark, highContrast: contrast, forPDF: false).integral
     }
 }
 
@@ -121,10 +117,26 @@ struct PlotAnnotationLayout {
         let label: CGRect
         let text: String
         let fullText: String
+        let upperVisible: Bool
+        let lowerVisible: Bool
 
         var valueHit: CGRect { label.insetBy(dx: -2, dy: -1.5) }
         var bracketHit: CGRect {
             CGRect(x: left - 2.5, y: y - 2, width: right - left + 5, height: 8)
+        }
+    }
+
+    struct IntegralCap {
+        let id: UUID
+        let index: Int
+        let upper: Bool          // Upper ppm is the LEFT cap on the descending axis.
+        let x: CGFloat
+        let y: CGFloat           // Centre of the four-point cap stroke.
+        let selected: Bool
+        var hit: CGRect { CGRect(x: x - 8, y: y - 8, width: 16, height: 16) }
+
+        func distance(to point: CGPoint) -> CGFloat {
+            hypot(point.x - x, max(0, abs(point.y - y) - 2))
         }
     }
 
@@ -135,9 +147,11 @@ struct PlotAnnotationLayout {
     let omittedPeaks: Int
     let omittedIntegrals: Int
 
-    private static let peakFont = PlotInk.font(11)
-    private static let bandFont = PlotInk.font(11)
-    private static let gap: CGFloat = 3
+    // These same fonts drive measurement, collision layout, drawing and the
+    // resulting label hit rectangles; do not enlarge only the drawn glyphs.
+    private static let peakFont = PlotInk.font(15)
+    private static let bandFont = PlotInk.font(16)
+    private static let gap: CGFloat = 5
 
     init(_ state: PlotState, geometry: PlotGeometry, size: CGSize) {
         let r = PlotRegions(size: size, field: geometry.field)
@@ -400,7 +414,7 @@ struct PlotAnnotationLayout {
             let a = (w.upperBound - min(w.upperBound, b.upperBound)) / span
             let z = (w.upperBound - max(w.lowerBound, b.lowerBound)) / span
             return (a + z) / 2
-        }, preferred: { s.bands[$0] == s.selectedBand })
+        }, preferred: { s.isSelectedBand($0) })
         guard !pick.indices.isEmpty, r.height >= PlotInk.measure("0", bandFont).height + 10
         else { return ([], pick.total) }
 
@@ -473,7 +487,7 @@ struct PlotAnnotationLayout {
         }
 
         var lanes = distribute(reserving: nil)
-        if let k = seeds.firstIndex(where: { s.bands[$0.index] == s.selectedBand }),
+        if let k = seeds.firstIndex(where: { s.isSelectedBand($0.index) }),
            !lanes.contains(where: { $0.contains(k) }) {
             lanes = distribute(reserving: k)
         }
@@ -489,10 +503,79 @@ struct PlotAnnotationLayout {
                 let label = CGRect(x: starts[k], y: y - 4 - b.size.height, width: b.size.width, height: b.size.height)
                 let id = s.bandIDs.indices.contains(b.index) ? s.bandIDs[b.index] : nil
                 result.append(Integral(index: b.index, id: id, left: b.left, right: b.right, y: y,
-                                       label: label, text: b.text, fullText: b.fullText))
+                                       label: label, text: b.text, fullText: b.fullText,
+                                       upperVisible: w.contains(s.bands[b.index].upperBound),
+                                       lowerVisible: w.contains(s.bands[b.index].lowerBound)))
             }
         }
         return (result, pick.total)
+    }
+
+    func integralCaps(state: PlotState) -> [IntegralCap] {
+        var result: [IntegralCap] = []
+        for b in integrals {
+            guard let id = b.id, state.bands.indices.contains(b.index),
+                  state.bands[b.index].lowerBound < state.bands[b.index].upperBound else { continue }
+            let selected = state.isSelectedBand(b.index)
+            if b.upperVisible {
+                result.append(IntegralCap(id: id, index: b.index, upper: true,
+                                          x: b.left, y: b.y + 2, selected: selected))
+            }
+            if b.lowerVisible {
+                result.append(IntegralCap(id: id, index: b.index, upper: false,
+                                          x: b.right, y: b.y + 2, selected: selected))
+            }
+        }
+        return result
+    }
+
+    func integralCap(at point: CGPoint, state: PlotState) -> IntegralCap? {
+        guard regions.gutter.contains(point) else { return nil }
+        return integralCaps(state: state).filter { $0.hit.contains(point) }.min { a, b in
+            let da = a.distance(to: point), db = b.distance(to: point)
+            if da != db { return da < db }
+            if a.selected != b.selected { return a.selected }
+            if a.id != b.id { return a.id.uuidString < b.id.uuidString }
+            if a.index != b.index { return a.index < b.index }
+            return a.upper && !b.upper
+        }
+    }
+
+    // Screen-only feedback uses the bounded, already laid-out visible bands.
+    // Cropped edges are not presented as editable endpoints.
+    func drawSelectedIntegral(state: PlotState, field: CGRect, color: NSColor) {
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSBezierPath(rect: field).addClip()
+        for b in integrals where state.isSelectedBand(b.index) {
+            color.withAlphaComponent(0.10).setFill()
+            CGRect(x: b.left, y: field.minY, width: max(0, b.right - b.left), height: field.height).fill()
+            let guide = color.withAlphaComponent(0.55)
+            if b.upperVisible {
+                PlotInk.line(CGPoint(x: b.left, y: field.minY), CGPoint(x: b.left, y: field.maxY), guide, 1)
+            }
+            if b.lowerVisible {
+                PlotInk.line(CGPoint(x: b.right, y: field.minY), CGPoint(x: b.right, y: field.maxY), guide, 1)
+            }
+        }
+    }
+
+    // Called only by the interactive screen view, never by an export renderer.
+    // The existing cap centres, hit tolerances and endpoint identity are intact.
+    func drawIntegralHandles(state: PlotState, color: NSColor) {
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        // Include the full square at crop edges without entering the data field.
+        NSBezierPath(rect: regions.gutter.insetBy(dx: -5, dy: -2)).addClip()
+        for cap in integralCaps(state: state) where cap.selected {
+            let rect = CGRect(x: cap.x - 4, y: cap.y - 4, width: 8, height: 8)
+            let path = NSBezierPath(rect: rect)
+            color.withAlphaComponent(0.25).setFill()
+            path.fill()
+            color.setStroke()
+            path.lineWidth = 1.5
+            path.stroke()
+        }
     }
 
     func integralID(at p: CGPoint) -> UUID? {
@@ -576,7 +659,11 @@ struct PlotAnnotationLayout {
         // Allow half the end-cap stroke at the crop edges.
         NSBezierPath(rect: regions.gutter.insetBy(dx: -1, dy: 0)).addClip()
         for b in integrals {
-            let selected = showSelection && state.bands[b.index] == state.selectedBand
+            let selected = showSelection && state.isSelectedBand(b.index)
+            if selected {
+                color.withAlphaComponent(0.10).setFill()
+                b.label.insetBy(dx: -3, dy: -1).fill()
+            }
             let p = NSBezierPath()
             p.move(to: CGPoint(x: b.left, y: b.y + 4))
             p.line(to: CGPoint(x: b.left, y: b.y))
@@ -602,7 +689,7 @@ struct PlotAnnotationLayout {
         NSBezierPath(rect: r).addClip()
         var right = r.maxX
         if !omissionNote.isEmpty {
-            let font = PlotInk.font(11)
+            let font = PlotInk.font(15)
             var note = omissionNote
             if PlotInk.measure(note, font).width > r.width * 0.72 {
                 var counts: [String] = []
@@ -616,7 +703,7 @@ struct PlotAnnotationLayout {
             PlotInk.draw(note, at: CGPoint(x: right, y: r.midY - size.height / 2), font: font, color: color)
             right -= 8
         }
-        let font = PlotInk.font(13)
+        let font = PlotInk.font(15)
         let text = PlotInk.fitted(title, font: font, width: right - r.minX)
         let h = PlotInk.measure(text, font).height
         PlotInk.draw(text, at: CGPoint(x: r.minX, y: r.midY - h / 2), font: font, color: color)

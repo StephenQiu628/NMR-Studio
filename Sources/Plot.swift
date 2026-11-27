@@ -14,6 +14,15 @@ struct PlotState {
     var selectedBand: ClosedRange<Double>? = nil
     var gain: Double = 1
     var bandIDs: [UUID] = []
+    var selectedBandID: UUID? = nil
+
+    func isSelectedBand(_ index: Int) -> Bool {
+        guard bands.indices.contains(index) else { return false }
+        if let selectedBandID {
+            return bandIDs.indices.contains(index) && bandIDs[index] == selectedBandID
+        }
+        return bands[index] == selectedBand
+    }
 
     var canPlot: Bool {
         let width = window.upperBound - window.lowerBound
@@ -46,7 +55,9 @@ struct PlotGeometry {
         let side = min(30, floor(w * 0.08))
         let narrow = min(1, max(0, (680 - w) / 360))
         let top = floor(min(h * 0.31, min(134, 48 + h * 0.08 + narrow * 12)))
-        let bottom = floor(min(h * 0.36, min(164, 58 + h * 0.12 + narrow * 12)))
+        // Keep two integral lanes at the 400 pt reference/test viewport after
+        // enlarging the axis and integral fonts; overlapping bands remain reachable.
+        let bottom = floor(min(h * 0.40, min(174, 76 + h * 0.13 + narrow * 12)))
         return CGRect(x: side, y: bottom, width: max(1, w - 2 * side),
                       height: max(1, h - bottom - top))
     }
@@ -81,6 +92,7 @@ struct PlotGeometry {
 }
 
 struct Plot: NSViewRepresentable {
+    @Environment(\.colorScheme) private var colorScheme
     var data: PlotState
     var tool: Tool
     var select: (Tool, ClosedRange<Double>) -> Void
@@ -90,13 +102,30 @@ struct Plot: NSViewRepresentable {
     var axisID = ""
     var reportProblem: (String) -> Void = { _ in }
     var onIntegralSelection: ((UUID) -> Void)? = nil
+    var integralEditing: ((UUID) -> PlotIntegralEdit?)? = nil
 
-    func makeNSView(context: Context) -> PlotView { PlotView() }
+    private func updateAppearance(_ view: PlotView) {
+        let name: NSAppearance.Name = colorScheme == .dark ? .darkAqua : .aqua
+        if view.appearance?.name != name {
+            // Local to the hosted screen view. Never change NSApp, defaults,
+            // or the independent white export renderer's appearance.
+            view.appearance = NSAppearance(named: name)
+            view.needsDisplay = true
+        }
+    }
+
+    func makeNSView(context: Context) -> PlotView {
+        let view = PlotView()
+        updateAppearance(view)
+        return view
+    }
 
     func updateNSView(_ view: PlotView, context: Context) {
+        updateAppearance(view)
         view.onIntegralSelection = onIntegralSelection
-        view.update(data)
+        view.integralEditing = integralEditing
         view.tool = tool
+        view.update(data)
         view.select = select
         view.boxes.enabled = { peakBox != nil }
         view.boxes.overlays = { annotations } // Retained API; not used as a drawing source.
@@ -109,7 +138,15 @@ struct Plot: NSViewRepresentable {
 
 final class PlotView: NSView {
     let boxes = NMRPeakBoxInteraction()
-    var tool = Tool.zoom
+    var tool = Tool.zoom {
+        didSet {
+            if tool != oldValue {
+                cancelIntegralDrag()
+                window?.invalidateCursorRects(for: self)
+                needsDisplay = true
+            }
+        }
+    }
     var select: ((Tool, ClosedRange<Double>) -> Void)?
     var onIntegralSelection: ((UUID) -> Void)? {
         didSet {
@@ -121,11 +158,26 @@ final class PlotView: NSView {
         }
     }
 
+    var integralEditing: ((UUID) -> PlotIntegralEdit?)? {
+        didSet {
+            if integralEditing == nil { cancelIntegralDrag() }
+            if (oldValue == nil) != (integralEditing == nil) {
+                window?.invalidateCursorRects(for: self)
+                needsDisplay = true
+            }
+        }
+    }
+
     var state: PlotState? {
         didSet {
             let axesChanged = oldValue?.window != state?.window ||
                 oldValue?.spectrum.ppm != state?.spectrum.ppm ||
                 oldValue?.spectrum.real != state?.spectrum.real
+            if axesChanged || oldValue?.gain != state?.gain ||
+                oldValue?.bands != state?.bands || oldValue?.bandIDs != state?.bandIDs ||
+                oldValue?.bandLabels != state?.bandLabels {
+                cancelIntegralDrag()
+            }
             if axesChanged {
                 cachedOrdinate = nil
                 cachedTrace = nil
@@ -134,7 +186,8 @@ final class PlotView: NSView {
                 oldValue?.bands != state?.bands || oldValue?.bandLabels != state?.bandLabels ||
                 oldValue?.bandIDs != state?.bandIDs || oldValue?.gain != state?.gain ||
                 oldValue?.selectedPeak != state?.selectedPeak ||
-                oldValue?.selectedBand != state?.selectedBand || oldValue?.title != state?.title {
+                oldValue?.selectedBand != state?.selectedBand ||
+                oldValue?.selectedBandID != state?.selectedBandID || oldValue?.title != state?.title {
                 cachedLayout = nil
                 needsLayout = true
                 window?.invalidateCursorRects(for: self)
@@ -148,13 +201,147 @@ final class PlotView: NSView {
     private var cachedLayout: (size: CGSize, plan: PlotAnnotationLayout)?
     private var start: CGFloat?, end: CGFloat?, hover: CGFloat?
     private var armedIntegral: (id: UUID, point: CGPoint)?
+    private struct IntegralDrag {
+        let cap: PlotAnnotationLayout.IntegralCap
+        let edit: PlotIntegralEdit
+        let point: CGPoint
+        let viewBounds: CGRect
+        let window: NSWindow
+        let tool: Tool
+        let viewport: ClosedRange<Double>
+        let endpointLimits: ClosedRange<Double>
+        var range: ClosedRange<Double>
+        var moved = false
+    }
+    private var integralDrag: IntegralDrag?
+    private var consumesIntegralDrag = false
+    private var integralPreview: PlotState? {
+        didSet {
+            cachedLayout = nil
+            needsLayout = true
+            needsDisplay = true
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+    var displayedState: PlotState? { integralPreview ?? state }
     private var plotTracking: NSTrackingArea?
     private var forPDF = false
 
     override var acceptsFirstResponder: Bool { true }
     var field: CGRect { PlotGeometry.field(size: bounds.size) }
 
-    func update(_ data: PlotState) { state = data }
+    func update(_ data: PlotState) {
+        state = data
+        if let drag = integralDrag, !integralDragIsCurrent(drag) { cancelIntegralDrag() }
+    }
+
+    private func integralDragIsCurrent(_ drag: IntegralDrag) -> Bool {
+        window === drag.window && window?.firstResponder === self &&
+            bounds == drag.viewBounds && tool == drag.tool && drag.edit.isCurrent()
+    }
+
+    private func beginIntegralDrag(at point: CGPoint) -> Bool {
+        guard tool == .zoom || tool == .integral,
+              let factory = integralEditing, let s = state, let g = geometry,
+              let cap = plan(s, g).integralCap(at: point, state: s),
+              let edit = factory(cap.id), edit.isCurrent(),
+              s.bands[cap.index] == edit.bounds, let window else { return false }
+        let width = edit.bounds.upperBound - edit.bounds.lowerBound
+        guard width.isFinite, width > 0 else { return false }
+        let endpoint = cap.upper ? edit.bounds.upperBound : edit.bounds.lowerBound
+        let index = s.spectrum.nearest(endpoint)
+        let neighbor = index + 1 < s.spectrum.ppm.count ? index + 1 : max(0, index - 1)
+        let spacing = abs(s.spectrum.ppm[index] - s.spectrum.ppm[neighbor])
+        let minimum = min(width, max(spacing * 0.1, max(1, abs(endpoint)) * Double.ulpOfOne * 8))
+        var low = max(s.window.lowerBound, edit.limits.lowerBound)
+        var high = min(s.window.upperBound, edit.limits.upperBound)
+        if cap.upper { low = max(low, edit.bounds.lowerBound + minimum) }
+        else { high = min(high, edit.bounds.upperBound - minimum) }
+        guard low.isFinite, high.isFinite, low <= high,
+              let preview = edit.preview(edit.bounds), window.makeFirstResponder(self) else { return false }
+        integralDrag = IntegralDrag(cap: cap, edit: edit, point: point, viewBounds: bounds,
+                                    window: window, tool: tool, viewport: s.window,
+                                    endpointLimits: low...high, range: edit.bounds)
+        consumesIntegralDrag = true
+        integralPreview = preview
+        let center = NotificationCenter.default
+        for name in [NSWindow.didResignKeyNotification, NSWindow.willCloseNotification] {
+            center.addObserver(self, selector: #selector(integralWindowChanged(_:)), name: name, object: window)
+        }
+        center.addObserver(self, selector: #selector(integralWindowChanged(_:)),
+                           name: NSApplication.didResignActiveNotification, object: nil)
+        return true
+    }
+
+    private func resizeIntegral(to point: CGPoint) {
+        guard var drag = integralDrag else { return }
+        guard integralDragIsCurrent(drag), point.x.isFinite else { cancelIntegralDrag(); return }
+        let dx = point.x - drag.point.x
+        if !drag.moved && abs(dx) < 2 { return }
+        drag.moved = true
+        let original = drag.edit.bounds
+        let endpoint = drag.cap.upper ? original.upperBound : original.lowerBound
+        let proposed = endpoint - Double(dx / field.width) *
+            (drag.viewport.upperBound - drag.viewport.lowerBound)
+        let value = min(drag.endpointLimits.upperBound, max(drag.endpointLimits.lowerBound, proposed))
+        // Returning to the original mouse position also restores its exact doubles.
+        let next = dx == 0 ? original : (drag.cap.upper ? original.lowerBound...value : value...original.upperBound)
+        guard next.lowerBound.isFinite, next.upperBound.isFinite, next.lowerBound < next.upperBound else { return }
+        if next != drag.range {
+            guard let preview = drag.edit.preview(next) else { return }
+            drag.range = next
+            integralPreview = preview
+        }
+        integralDrag = drag
+        // The tooltip also updates when a moved endpoint is clamped and the
+        // preview range itself does not change. No layout invalidation needed.
+        needsDisplay = true
+    }
+
+    private func finishIntegralDrag() {
+        let drag = integralDrag
+        let valid = drag.map { integralDragIsCurrent($0) } ?? false
+        consumesIntegralDrag = false
+        cancelIntegralDrag()
+        guard let drag, valid else { return }
+        if drag.range != drag.edit.bounds { drag.edit.commit(drag.range) }
+        else { onIntegralSelection?(drag.cap.id) }
+    }
+
+    private func cancelIntegralDrag() {
+        integralDrag = nil
+        if integralPreview != nil { integralPreview = nil }
+        // Keep consumesIntegralDrag until mouse-up: a cancelled cap drag must
+        // never fall through into zoom, peak boxing or new-integral creation.
+        let center = NotificationCenter.default
+        for name in [NSWindow.didResignKeyNotification, NSWindow.willCloseNotification,
+                     NSApplication.didResignActiveNotification] {
+            center.removeObserver(self, name: name, object: nil)
+        }
+    }
+
+    @objc private func integralWindowChanged(_ notification: Notification) { cancelIntegralDrag() }
+
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        if accepted { cancelIntegralDrag() }
+        return accepted
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        if newSize != frame.size { cancelIntegralDrag() }
+        super.setFrameSize(newSize)
+    }
+
+    override func setBoundsSize(_ newSize: NSSize) {
+        if newSize != bounds.size { cancelIntegralDrag() }
+        super.setBoundsSize(newSize)
+    }
+
+    override func setBoundsOrigin(_ newOrigin: NSPoint) {
+        if newOrigin != bounds.origin { cancelIntegralDrag() }
+        super.setBoundsOrigin(newOrigin)
+    }
 
     private var geometry: PlotGeometry? {
         guard let s = state, s.canPlot else { return nil }
@@ -215,7 +402,7 @@ final class PlotView: NSView {
     override func layout() {
         super.layout()
         if !forPDF {
-            if let s = state, let g = geometry { _ = plan(s, g) }
+            if let s = displayedState, let g = geometry { _ = plan(s, g) }
             else { setAccessibilityCustomActions([]) }
         }
     }
@@ -237,12 +424,20 @@ final class PlotView: NSView {
     override func resetCursorRects() {
         super.resetCursorRects()
         addCursorRect(field, cursor: .crosshair)
-        guard onIntegralSelection != nil, let s = state, let g = geometry else { return }
+        guard let s = displayedState, let g = geometry else { return }
         let p = plan(s, g)
-        for b in p.integrals where b.id != nil {
-            for hit in [b.valueHit, b.bracketHit] {
-                let r = hit.intersection(p.regions.gutter)
-                if !r.isNull && !r.isEmpty { addCursorRect(r, cursor: .pointingHand) }
+        if onIntegralSelection != nil {
+            for b in p.integrals where b.id != nil {
+                for hit in [b.valueHit, b.bracketHit] {
+                    let r = hit.intersection(p.regions.gutter)
+                    if !r.isNull && !r.isEmpty { addCursorRect(r, cursor: .pointingHand) }
+                }
+            }
+        }
+        if integralEditing != nil, tool == .zoom || tool == .integral {
+            for cap in p.integralCaps(state: s) {
+                let r = cap.hit.intersection(p.regions.gutter)
+                if !r.isNull && !r.isEmpty { addCursorRect(r, cursor: .resizeLeftRight) }
             }
         }
     }
@@ -260,16 +455,19 @@ final class PlotView: NSView {
 
     private func integral(at point: CGPoint) -> UUID? {
         guard onIntegralSelection != nil, point.y < field.minY,
-              let s = state, let g = geometry else { return nil }
+              let s = displayedState, let g = geometry else { return nil }
         return plan(s, g).integralID(at: point)
     }
 
     override func mouseDown(with event: NSEvent) {
+        cancelIntegralDrag()
+        consumesIntegralDrag = false
         start = nil
         end = nil
         armedIntegral = nil
         if boxes.mouseDown(event, in: self) { window?.makeFirstResponder(self); return }
         let p = convert(event.locationInWindow, from: nil)
+        if beginIntegralDrag(at: p) { return }
         if let id = integral(at: p) {
             armedIntegral = (id, p)
             window?.makeFirstResponder(self)
@@ -281,6 +479,10 @@ final class PlotView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if consumesIntegralDrag {
+            resizeIntegral(to: convert(event.locationInWindow, from: nil))
+            return
+        }
         if boxes.mouseDragged(event, in: self) { return }
         let p = convert(event.locationInWindow, from: nil)
         if let a = armedIntegral {
@@ -294,6 +496,7 @@ final class PlotView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if consumesIntegralDrag { finishIntegralDrag(); return }
         if boxes.mouseUp(event, in: self) { return }
         let p = convert(event.locationInWindow, from: nil)
         if let a = armedIntegral {
@@ -318,6 +521,7 @@ final class PlotView: NSView {
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 {
+            if consumesIntegralDrag { cancelIntegralDrag(); return }
             if boxes.cancel(in: self) { return }
             if start != nil || armedIntegral != nil {
                 start = nil; end = nil; armedIntegral = nil
@@ -329,6 +533,7 @@ final class PlotView: NSView {
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
+        cancelIntegralDrag()
         boxes.cancel(in: self)
         start = nil; end = nil; hover = nil; armedIntegral = nil
         super.viewWillMove(toWindow: newWindow)
@@ -376,14 +581,14 @@ final class PlotView: NSView {
 
     private func drawAxes(_ s: PlotState, _ g: PlotGeometry, _ regions: PlotRegions, _ c: PlotPalette) {
         let r = g.field, w = s.window, axis = regions.axisY
-        let target = (w.upperBound - w.lowerBound) / Double(max(2, min(192, floor(r.width / 72))))
+        let target = (w.upperBound - w.lowerBound) / Double(max(2, min(192, floor(r.width / 96))))
         let unit = pow(10.0, floor(log10(target)))
         let step = ([1.0, 2, 5, 10].first { $0 * unit >= target } ?? 10) * unit
-        var tickLabelBottom = axis - 4
+        var tickLabelBottom = axis - 6
         if step.isFinite, step > 0 {
             let first = ceil(w.lowerBound / step) * step
             let digits = Int(min(9, max(0, -floor(log10(step)))))
-            let font = PlotInk.font(12)
+            let font = PlotInk.font(16)
             let hair: CGFloat = forPDF ? 0.65 : 1 / max(1, window?.backingScaleFactor ?? 1)
             var labelLimit = bounds.maxX
             for i in 0..<196 {
@@ -395,18 +600,18 @@ final class PlotView: NSView {
                 let text = PlotInk.shift(abs(tick) < step * 1e-6 ? 0 : tick, digits: digits)
                 let size = PlotInk.measure(text, font)
                 let left = max(bounds.minX, min(bounds.maxX - size.width, x - size.width / 2))
-                let y = axis - 4 - size.height
+                let y = axis - 6 - size.height
                 // Ticks arrive right to left. Keep the grid even when two numbers won't fit.
                 if y >= bounds.minY, left + size.width <= labelLimit {
                     PlotInk.draw(text, at: CGPoint(x: left, y: y), font: font, color: c.axis)
-                    labelLimit = left - 3
+                    labelLimit = left - 8
                     tickLabelBottom = min(tickLabelBottom, y)
                 }
             }
         }
         PlotInk.line(CGPoint(x: r.minX, y: g.y(0)), CGPoint(x: r.maxX, y: g.y(0)), c.grid, 0.7)
         PlotInk.line(CGPoint(x: r.minX, y: axis), CGPoint(x: r.maxX, y: axis), c.axis, 0.85)
-        let font = PlotInk.font(13)
+        let font = PlotInk.font(17)
         let text = PlotInk.fitted("Chemical shift, δ (ppm)", font: font, width: r.width)
         let size = PlotInk.measure(text, font)
         if !text.isEmpty, size.height + 4 <= tickLabelBottom {
@@ -414,41 +619,74 @@ final class PlotView: NSView {
         }
     }
 
+    private func drawIntegralDragTooltip(_ s: PlotState, _ g: PlotGeometry, _ c: PlotPalette) {
+        // Read the already validated live drag; never request a new preview,
+        // change an endpoint, or synthesize a mark while drawing.
+        guard let drag = integralDrag, drag.moved else { return }
+        let r = g.field
+        guard r.width > 48, r.height > 44 else { return }
+        let value = drag.cap.upper ? drag.range.upperBound : drag.range.lowerBound
+        let name = drag.cap.upper ? "上界" : "下界"
+        let font = PlotInk.font(15)
+        let text = PlotInk.fitted("\(name) \(PlotInk.shift(value, digits: 6)) ppm",
+                                  font: font, width: r.width - 24)
+        guard !text.isEmpty else { return }
+        let size = PlotInk.measure(text, font)
+        let width = size.width + 16
+        let x = min(r.maxX - width - 4, max(r.minX + 4, g.x(value, in: s.window) - width / 2))
+        let box = CGRect(x: x, y: r.minY + 8, width: width, height: size.height + 10)
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSBezierPath(rect: r).addClip()
+        let path = NSBezierPath(roundedRect: box, xRadius: 5, yRadius: 5)
+        c.background.setFill()
+        path.fill()
+        c.selection.withAlphaComponent(0.8).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        PlotInk.draw(text, at: CGPoint(x: box.minX + 8, y: box.minY + 5), font: font, color: c.text)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         let dark = !forPDF && effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let contrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
         let c = PlotPalette(dark: dark, highContrast: contrast, forPDF: forPDF)
+        let interactive = !forPDF && NSGraphicsContext.current?.isDrawingToScreen == true
         c.background.setFill()
         bounds.fill()
-        guard let s = state, let g = geometry else { return }
+        guard let s = displayedState, let g = geometry else { return }
         let r = g.field, p = plan(s, g)
         drawAxes(s, g, p.regions, c)
 
         NSGraphicsContext.saveGraphicsState()
         NSBezierPath(rect: r).addClip()
+        if interactive { p.drawSelectedIntegral(state: s, field: r, color: c.selection) }
         c.trace.setStroke()
         trace(s, g).stroke()
-        p.drawTraceTicks(color: c.peak, selected: forPDF ? nil : s.selectedPeak)
+        p.drawTraceTicks(color: c.peak, selected: interactive ? s.selectedPeak : nil)
         NSGraphicsContext.restoreGraphicsState()
 
         p.drawPeakStrip(colors: c)
-        p.drawIntegrals(state: s, color: PlotInk.integralGreen(dark: dark, contrast: contrast),
-                        showSelection: !forPDF)
+        p.drawIntegrals(state: s, color: c.integral, showSelection: interactive)
+        if interactive, integralEditing != nil, tool == .zoom || tool == .integral {
+            p.drawIntegralHandles(state: s, color: c.integral)
+        }
 
         var heading = forPDF ? PlotInk.singleLine(s.title) : ""
-        if !forPDF {
+        if interactive {
             boxes.draw(in: self)
             if let a = start, let b = end {
                 c.selection.withAlphaComponent(0.12).setFill()
                 CGRect(x: min(a, b), y: r.minY, width: abs(a - b), height: r.height).fill()
             }
-            if let h = hover, h >= r.minX, h <= r.maxX {
+            if integralDrag == nil, let h = hover, h >= r.minX, h <= r.maxX {
                 let v = g.ppm(atX: h, in: s.window)
                 PlotInk.line(CGPoint(x: h, y: r.minY), CGPoint(x: h, y: r.maxY),
                              c.selection.withAlphaComponent(0.45), 0.8)
                 heading = String(format: "%.4f ppm   %.5g a.u.", locale: Locale.current,
                                  v, s.spectrum.real[s.spectrum.nearest(v)])
             }
+            drawIntegralDragTooltip(s, g, c)
         }
         p.drawHeader(heading, color: c.text)
     }

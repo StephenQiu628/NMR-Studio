@@ -106,8 +106,10 @@ public struct NMREstimator<S: Sendable, V: Sendable>: Sendable {
     public typealias Estimate = @Sendable (S, NMRCheckpoint) throws -> V
     public let id: String // stable, e.g. a solver name + algorithm revision
     public let estimate: Estimate
-    public init(id: String, estimate: @escaping Estimate) {
+    public let appliedName: (@Sendable (V) -> String)?
+    public init(id: String, appliedName: (@Sendable (V) -> String)? = nil, estimate: @escaping Estimate) {
         self.id = id
+        self.appliedName = appliedName
         self.estimate = estimate
     }
 }
@@ -281,10 +283,10 @@ enum NMRImportWorker {
                 try check()
                 let s = try apply(input, p, check)
                 try check()
-                return (s, .applied(method: method.id, parameters: p))
+                return (s, .applied(method: method.appliedName?(p) ?? method.id, parameters: p))
             } catch let rejection as NMRDeclined {
                 try check()
-                reasons.append("\(method.id)：\(rejection.reason)")
+                reasons.append(chain.count == 1 ? rejection.reason : "\(method.id)：\(rejection.reason)")
             }
         }
         try check()

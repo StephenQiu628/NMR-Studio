@@ -9,21 +9,34 @@ struct Mark: Identifiable, Codable {
 }
 @MainActor final class Workbench: ObservableObject {
     @Published var dataset = Dataset.demo
-    @Published var spectrum: Spectrum
-    @Published var settings = Settings()
-    @Published var applied = Settings()
-    @Published var window: ClosedRange<Double>
+    @Published var spectrum: Spectrum {
+        didSet { integralInteractionRevision = UUID() }
+    }
+    @Published var settings = Settings() {
+        didSet { if settings != oldValue { integralInteractionRevision = UUID() } }
+    }
+    @Published var applied = Settings() {
+        didSet { if applied != oldValue { integralInteractionRevision = UUID() } }
+    }
+    @Published var window: ClosedRange<Double> {
+        didSet { if window != oldValue { integralInteractionRevision = UUID() } }
+    }
     @Published var marks = [Mark]() {
         didSet {
+            integralInteractionRevision = UUID()
             if let id = selectedAnnotationID, !marks.contains(where: { $0.id == id }) {
                 selectedAnnotationID = nil
             }
             peakWorkspace?.hostMarksChanged()
         }
     }
-    @Published var tool = Tool.zoom
+    @Published var tool = Tool.zoom {
+        didSet { if tool != oldValue { integralInteractionRevision = UUID() } }
+    }
     @Published var error: String?
-    @Published var busy = false
+    @Published var busy = false {
+        didSet { if busy != oldValue { integralInteractionRevision = UUID() } }
+    }
     @Published var status = "模拟谱已载入"
     @Published private(set) var documentRevision = UUID()
     @Published private(set) var calibration: ShiftCalibrationRecord?
@@ -54,6 +67,9 @@ struct Mark: Identifiable, Codable {
         if id != selectedAnnotationID { selectedAnnotationID = id }
     }
 
+    // Invalidates in-flight mouse edits even when a transient change is reverted
+    // before the next AppKit event. Selection and trial drawing do not advance it.
+    private(set) var integralInteractionRevision = UUID()
     private(set) var peakBinding = UUID()
     private var unmountedFile: NMRPeakFile?
     private var peakFileForStorage: NMRPeakFile? { peakWorkspace?.file ?? unmountedFile }
@@ -67,7 +83,9 @@ struct Mark: Identifiable, Codable {
     private var projectURL: URL?
     @Published private(set) var reference: IntegrationReference?
     @Published private(set) var journal = SessionJournal()
-    @Published private(set) var previewSpectrum: Spectrum?
+    @Published private(set) var previewSpectrum: Spectrum? {
+        didSet { integralInteractionRevision = UUID() }
+    }
     private var previewOffset = 0.0
     @Published var showHistory = false
     @Published var pngWidth = 2400

@@ -66,11 +66,8 @@ struct StudioImport: NMRAutoOpenHost {
         return spectrum
     }, subtractEndpoints: { phased, receipt, check in
         try check()
-        guard receipt.count == phased.real.count,
-              case let .affine(first, last, _, _) = receipt.decision else {
-            throw NMRDeclined("未得到可用基线")
-        }
-        return Spectrum(ppm: phased.ppm, real: NMRProcessingWorkflow.subtractLine(phased.real, first, last))
+        if case let .skipped(why) = receipt.decision { throw NMRDeclined(why.title) }
+        return Spectrum(ppm: phased.ppm, real: try receipt.applying(to: phased.real))
     }, isUsable: { s, check in
         try check()
         return s.ppm.count >= 2 && s.ppm.count == s.real.count &&
@@ -104,7 +101,7 @@ struct StudioImport: NMRAutoOpenHost {
     }
 
     func phaseEstimators(_ raw: Dataset, settings: Settings) -> [NMREstimator<Spectrum, StudioPhase>] {
-        [NMREstimator(id: "全谱峰形／ACME") { signal, check in
+        [NMREstimator(id: "多峰自动调相") { signal, check in
             try check()
             do {
                 let fit = try estimateSpectralPhase(signal, initialFirstOrder: settings.p1)
@@ -114,9 +111,15 @@ struct StudioImport: NMRAutoOpenHost {
     }
 
     func conservativeBaselines(_ raw: Dataset, settings: Settings) -> [NMREstimator<Spectrum, NMRBaselineReceipt>] {
-        [NMREstimator(id: "自动直线基线") { phased, check in
+        [NMREstimator(id: "自动基线", appliedName: { receipt in
+            switch receipt.decision {
+            case .affine: return "直线基线"
+            case .smoothV1: return "Whittaker 平滑基线"
+            case .skipped(let reason): return reason.title
+            }
+        }) { phased, check in
             try check()
-            let decision = NMRFloor.decide(phased.processingArrays)
+            let decision = NMRFloor.decide(NMRArrays(ppm: phased.ppm, real: phased.real))
             if case .skipped(let why) = decision { throw NMRDeclined(why.title) }
             return NMRBaselineReceipt(count: phased.real.count, decision: decision)
         }]

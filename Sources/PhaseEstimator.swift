@@ -9,17 +9,8 @@ private enum SpectralPhase1D {
         return x - turn * (x / turn).rounded()
     }
 
-    struct Z {
-        var r: Double
-        var i: Double
-        var power: Double { return r * r + i * i }
-    }
-
-    struct Proposal {
-        let level: Int
-        let bin: Int
-        let strength: Double
-    }
+    typealias Z = RegionalPhase.Z
+    typealias Proposal = RegionalPhase.Proposal
 
     struct Anchor {
         let x: Double       // FFT index / (n - 1), NOT a ppm fraction
@@ -248,7 +239,12 @@ private enum SpectralPhase1D {
                       width: best.w * cell / last, angle: wrap(-obs.angle), quality: quality)
     }
 
-    static func anchors(_ root: [Z]) -> [Anchor] {
+    struct Measurements {
+        let wing: RegionalPhase.Check
+        let local: [Anchor]
+    }
+
+    static func measurements(_ root: [Z]) -> Measurements {
         // Fewer than 2*n complex samples over the entire averaging pyramid.
         // Scan all scales in O(n); neither fit windows nor the number of
         // nonlinear searches grows with the FFT length.
@@ -290,6 +286,8 @@ private enum SpectralPhase1D {
             }
             bands.append(next)
         }
+        let wing = RegionalPhase.assess(bands: bands, noise: noise, lists: lists)
+        if wing.solution != nil { return Measurements(wing: wing, local: []) }
         var fits = [Anchor]()
         for b in 0..<tiles {
             lists[b].sort { $0.strength > $1.strength }
@@ -310,7 +308,7 @@ private enum SpectralPhase1D {
             }
             if !overlaps { independent.append(a) }
         }
-        return independent.sorted { $0.x < $1.x }
+        return Measurements(wing: wing, local: independent.sorted { $0.x < $1.x })
     }
 
     struct Line {
@@ -425,8 +423,9 @@ private enum SpectralPhase1D {
         guard n >= 9, im.count == n, ppm.count == n else {
             throw NMRError("自动调相至少需要九个实部、虚部与 ppm 一一对应的采样点。")
         }
-        var scale = 0.0
+        var scale = 0.0, varies = false
         for j in 0..<n {
+            if re[j] != re[0] || im[j] != im[0] { varies = true }
             guard re[j].isFinite, im[j].isFinite, ppm[j].isFinite else {
                 throw NMRError("谱图含无效采样值，无法自动调相。")
             }
@@ -434,6 +433,8 @@ private enum SpectralPhase1D {
             scale = max(scale, max(abs(re[j]), abs(im[j])))
         }
         guard scale > 0.0 else { throw NMRError("谱图信号全为零，无法估计相位。") }
+
+        guard varies else { throw NMRError("谱图为常量，无法可靠估计相位。") }
 
         // Normalize before forming powers. Apply the known ramp first, with
         // periodic oscillator resets to bound drift on long transforms.
@@ -454,8 +455,14 @@ private enum SpectralPhase1D {
             s = s * cr + c * si
             c = nc
         }
-        let a = anchors(z)
-        if let (line, used) = consensus(a, linear: true) {
+        let measured = measurements(z)
+        if let f = measured.wing.solution {
+            let p1 = initial + f.delta / rad
+            guard p1.isFinite else { throw NMRError("一阶相位超出数值范围。") }
+            return (wrap(f.edge) / rad, p1, f.regions, f.fitted)
+        }
+        let a = measured.local
+        if measured.wing.allowRamp, let (line, used) = consensus(a, linear: true) {
             let p1 = initial + line.slope / rad
             guard p1.isFinite else { throw NMRError("一阶相位超出数值范围。") }
             return (wrap(line.mid - 0.5 * line.slope) / rad, p1, used, true)
@@ -465,12 +472,23 @@ private enum SpectralPhase1D {
         }
         // A cluster can identify the absorption phase even if individual
         // line fits disagree or the data cannot constrain a full-band ramp.
-        return try estimateByEntropy(real: re, imag: im, initialFirstOrder: initial)
+        let fallback = try estimateByEntropy(real: re, imag: im, initialFirstOrder: initial)
+        guard !fallback.fittedFirstOrder || measured.wing.allowRamp else {
+            throw NMRError("独立峰区不足或相位绕转不明确，无法确认一阶相位。")
+        }
+        return fallback
     }
 }
 
 /// Degrees, left-edge anchored, for multiplication by exp(+i*theta).
 /// regions counts independent inlier regions, not bins or scale detections.
 func estimateSpectralPhase(_ spectrum: Spectrum, initialFirstOrder: Double) throws -> (p0: Double, p1: Double, regions: Int, fittedFirstOrder: Bool) {
-    return try SpectralPhase1D.run(spectrum, initial: initialFirstOrder)
+    let estimate = try SpectralPhase1D.run(spectrum, initial: initialFirstOrder)
+    if let imaginary = spectrum.imag,
+       let refined = AbsorptionRefinement.refine(real: spectrum.real, imag: imaginary,
+                                                seedP0: estimate.p0, seedP1: estimate.p1) {
+        let edge = refined.p0.remainder(dividingBy: 360)
+        return (edge, refined.p1, refined.regions, true)
+    }
+    return estimate
 }

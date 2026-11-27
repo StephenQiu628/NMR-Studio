@@ -202,10 +202,12 @@ private struct NRSurface: View {
     let makeMap: (CGSize) -> NRPlotMap?, live: Bool, snap: Bool
     let marks: [NRMark], measured: Double?, clicked: (NRProbe) -> Void
     @State private var pointer: CGPoint?
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         GeometryReader { geo in
             let map = makeMap(geo.size)
+            let colors = StudioColors(dark: colorScheme == .dark)
             ZStack {
                 if let m = map, m.offsetPPM == offset {
                     let probe = live ? pointer.flatMap { index.probe($0, in: m, radii: radii, snapping: snap) } : nil
@@ -220,14 +222,18 @@ private struct NRSurface: View {
                         }
                         if let d = measured {
                             let x = m.x(d - offset)
-                            if x >= m.rect.minX && x <= m.rect.maxX { line(CGPoint(x: x, y: m.rect.minY), CGPoint(x: x, y: m.rect.maxY), .accentColor) }
+                            if x >= m.rect.minX && x <= m.rect.maxX { line(CGPoint(x: x, y: m.rect.minY), CGPoint(x: x, y: m.rect.maxY), colors.accent) }
                         }
                         for mark in marks {
-                            let p = CGPoint(x: m.x(mark.rawPPM), y: m.y(mark.ordinate)); if m.contains(p) { ring(p, 6, .accentColor) }
+                            let p = CGPoint(x: m.x(mark.rawPPM), y: m.y(mark.ordinate)); if m.contains(p) { ring(p, 6, colors.accent) }
                         }
                         if let h = probe {
-                            if h.peak != nil { line(h.pointer, h.marker, .orange.opacity(0.55)) }
-                            ring(h.marker, 4, h.peak == nil ? .secondary : .orange)
+                            if h.peak != nil { line(h.pointer, h.marker, colors.accent.opacity(0.55)) }
+                            ring(h.marker, h.peak == nil ? 4 : 6, h.peak == nil ? colors.secondary : colors.accent)
+                            if h.peak != nil {
+                                let dot = CGRect(x: h.marker.x - 1.5, y: h.marker.y - 1.5, width: 3, height: 3)
+                                c.fill(Path(ellipseIn: dot), with: .color(colors.accent))
+                            }
                         }
                     }.allowsHitTesting(false)
                 }
@@ -245,10 +251,12 @@ private struct NRGroup: Identifiable { let id: String, name: String }
 
 struct NMRReferencePicker<Plot: View>: View {
     @Binding var isReferencing: Bool
+    @Environment(\.colorScheme) private var colorScheme
     let scope: NRScope, index: NRPeakIndex, targets: [NRTarget], radii: NRRadii
     let undoableID: UUID?, edits: NREditActions, map: (CGSize) -> NRPlotMap?, plot: () -> Plot
-    init(isReferencing: Binding<Bool>, scope: NRScope, index: NRPeakIndex, targets: [NRTarget], radii: NRRadii = NRRadii(), undoableID: UUID?, edits: NREditActions, map: @escaping (CGSize) -> NRPlotMap?, @ViewBuilder plot: @escaping () -> Plot) {
-        _isReferencing = isReferencing; self.scope = scope; self.index = index; self.targets = targets; self.radii = radii; self.undoableID = undoableID; self.edits = edits; self.map = map; self.plot = plot
+    let nucleusControls: AnyView?, plotHeader: AnyView?
+    init(isReferencing: Binding<Bool>, scope: NRScope, index: NRPeakIndex, targets: [NRTarget], radii: NRRadii = NRRadii(), undoableID: UUID?, edits: NREditActions, nucleusControls: AnyView? = nil, plotHeader: AnyView? = nil, map: @escaping (CGSize) -> NRPlotMap?, @ViewBuilder plot: @escaping () -> Plot) {
+        _isReferencing = isReferencing; self.scope = scope; self.index = index; self.targets = targets; self.radii = radii; self.undoableID = undoableID; self.edits = edits; self.nucleusControls = nucleusControls; self.plotHeader = plotHeader; self.map = map; self.plot = plot
     }
 
     @State private var group = ""
@@ -265,6 +273,7 @@ struct NMRReferencePicker<Plot: View>: View {
     @State private var first: NRMark?
     @State private var pick: NRPick?
     @State private var message = ""
+    @State private var activeChoice: String?
 
     private var available: [NRTarget] { targets.filter { !$0.custom && $0.nucleusKey == scope.nucleusKey && scope.nucleusKey != "unknown" && $0.ppm.isFinite } }
     private var groups: [NRGroup] {
@@ -311,7 +320,8 @@ struct NMRReferencePicker<Plot: View>: View {
         do {
             guard isReferencing, let f = frozen, let p = pick, f.scope == scope else { throw NRFailure("Stale pick") }
             let e = try NRReferenceEdit(scope: f.scope, target: f.target, pick: p, acknowledged: acknowledged)
-            try edits.commit(e); clearPick(); isReferencing = false; message = e.report
+            try edits.commit(e); clearPick(); isReferencing = false
+            message = "已定标：\(String(e.pick.observedPPM)) → \(String(e.target.ppm)) ppm，偏移 \(nrSigned(e.deltaPPM)) ppm。"
         } catch { message = error.localizedDescription }
     }
     private func undo() {
@@ -319,62 +329,308 @@ struct NMRReferencePicker<Plot: View>: View {
         do { try edits.undo(scope, id); clearPick(); message = "Last reference undone." } catch { message = error.localizedDescription }
     }
 
-    private var chooser: some View {
-        VStack(alignment: .leading) {
-            HStack {
-                Picker("参考溶剂", selection: $group) {
-                    Text("请选择…").tag(""); ForEach(groups) { g in Text(g.name).tag(g.id) }; Text("自定义…").tag("custom")
-                }.onChange(of: group) { _ in lineID = "" }
-                if group != "custom" {
-                    Picker("参考位点", selection: $lineID) {
-                        Text("请选择…").tag("")
-                        ForEach(available.filter { $0.groupKey == group }) { t in Text("\(t.material): \(t.site) (\(String(t.ppm)) ppm)").tag(t.id) }
-                    }
+    private var colors: StudioColors { StudioColors(dark: colorScheme == .dark) }
+
+    // Translate presentation only: recorded provenance and validation errors
+    // retain their existing representation and transaction semantics.
+    private var statusMessage: String {
+        switch message {
+        case "Nonfinite coordinate": return "坐标无效，请重新选点。"
+        case "Enter measured ppm on the displayed axis": return "请输入当前坐标上的有效实测 ppm。"
+        case "Invalid single pick": return "取点无效，请重新选点。"
+        case "Click two distinct, like-polarity symmetric endpoints of the same multiplet":
+            return "请选择同一多重峰中两个不同、同极性的对称端点。"
+        case "Invalid measured ppm": return "实测位置无效，请重新取点或输入。"
+        case "Incompatible target or center measurement": return "参考位点与核种或取点方式不匹配。"
+        case "Explicit assignment confirmation required": return "请先确认参考峰归属。"
+        case "Invalid calibration coordinates": return "定标坐标无效，请重新选点。"
+        case "Axis/data changed. Pick again.": return "谱图或坐标已变化，请重新选点。"
+        case "That reference is no longer the undoable head": return "该定标已不是最近一次操作，无法撤销。"
+        case "Discard the old pick and try again": return "请重新选点，舍弃旧的测量。"
+        case "Choose a reference line or complete the custom target first": return "请先选择参考位点或填写完整的自定义参考。"
+        case "No eligible extremum here. Move closer, or explicitly choose a manual method.":
+            return "附近没有可吸附的峰顶。请靠近峰顶，或改用手动取点。"
+        case "First endpoint held. Click its symmetric partner.": return "已记录第一个端点，请点选另一侧的对称谱线。"
+        case "Stale pick": return "测量已失效，请重新选点。"
+        case "Last reference undone.": return "已撤销上次定标。"
+        case "Spectrum or axis changed; staged pick discarded.": return "谱图或坐标已变化，已清除待应用的测量。"
+        default: return message
+        }
+    }
+
+    private func note(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 15))
+            .foregroundColor(colors.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func choiceItem(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button {
+            activeChoice = nil
+            action()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark").opacity(selected ? 1 : 0)
+                Text(title).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .font(.system(size: 17))
+            .padding(.horizontal, 8)
+            .frame(minHeight: 36)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // Native macOS Menu labels ignore the larger text size. A popover keeps
+    // both the selected value and each choice readable at the same size.
+    private func choiceMenu<Choices: View>(_ title: String, value: String,
+                                          @ViewBuilder choices: @escaping () -> Choices) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title).font(.system(size: 17, weight: .medium))
+            Button { activeChoice = title } label: {
+                HStack(spacing: 8) {
+                    Text(value).frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: "chevron.down").font(.system(size: 11, weight: .semibold))
                 }
+                .font(.system(size: 17))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: Binding(get: { activeChoice == title }, set: { if !$0 { activeChoice = nil } }), arrowEdge: .leading) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) { choices() }.padding(10)
+                }
+                .frame(width: 330, height: min(360, CGFloat(title == "参考溶剂" ? groups.count + 2 : (title == "取点方式" ? NRMethod.allCases.count : available.filter { $0.groupKey == group }.count + 1)) * 40 + 20))
+                .studioTheme()
+            }
+            .background(colors.raised, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(colors.border, lineWidth: 1))
+            .tint(colors.text)
+            .help(value)
+            .accessibilityLabel(Text(title))
+            .accessibilityValue(Text(value))
+        }
+    }
+
+    private func entryField(_ title: String, text: Binding<String>, prompt: String) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title).font(.system(size: 17, weight: .medium))
+            TextField(title, text: text, prompt: Text(prompt).foregroundColor(colors.secondary))
+                .textFieldStyle(.plain)
+                .font(.system(size: 17))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .background(colors.raised, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(colors.border, lineWidth: 1))
+                .accessibilityLabel(Text(title))
+        }
+    }
+
+    private func referenceLabel(_ t: NRTarget) -> String {
+        "\(t.material) · \(t.site) · \(String(t.ppm)) ppm"
+    }
+
+    private var chooser: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            choiceMenu("参考溶剂", value: group == "custom" ? "自定义参考" : (groups.first { $0.id == group }?.name ?? "请选择参考溶剂")) {
+                choiceItem("请选择…", selected: group.isEmpty) { group = "" }
+                ForEach(groups) { g in
+                    choiceItem(g.name, selected: group == g.id) { group = g.id }
+                }
+                Divider()
+                choiceItem("自定义…", selected: group == "custom") { group = "custom" }
             }
             if group == "custom" {
-                HStack { TextField("标准名称", text: $customName); TextField("参考溶剂（可选）", text: $customSolvent); TextField("目标 ppm", text: $customValue) }
+                entryField("标准名称", text: $customName, prompt: "输入参考物名称")
+                entryField("参考溶剂（可选）", text: $customSolvent, prompt: "输入参考介质")
+                entryField("目标位移 (ppm)", text: $customValue, prompt: "输入目标 ppm")
                 Toggle("目标值对应多重峰中心", isOn: $customCenter)
+                    .toggleStyle(.checkbox)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(minHeight: 36, alignment: .leading)
+            } else {
+                choiceMenu("参考位点", value: target.map { referenceLabel($0) } ?? "请选择参考位点") {
+                    choiceItem("请选择…", selected: lineID.isEmpty) { lineID = "" }
+                    ForEach(available.filter { $0.groupKey == group }) { t in
+                        choiceItem(referenceLabel(t), selected: lineID == t.id) { lineID = t.id }
+                    }
+                }
+                .disabled(group.isEmpty)
             }
-            if let t = target, !t.note.isEmpty { Text(t.note).font(.callout) }
-        }.disabled(frozen != nil)
+            if let t = target, !t.note.isEmpty { note(t.note) }
+        }
+        .disabled(frozen != nil)
+        .onChange(of: group) { _ in lineID = "" }
     }
+
     private var acquisition: some View {
-        VStack(alignment: .leading) {
-            Picker("实测位置来源", selection: Binding(get: { effective }, set: { method = $0 })) {
-                ForEach(NRMethod.allCases.filter { target?.permits($0) != false }, id: \.self) { m in Text(m.label).tag(m) }
-            }.disabled(frozen != nil)
-            if effective == .typed {
-                HStack { TextField("实测 ppm（当前坐标）", text: $measuredText); Button("预览偏移") { stageTyped() } }.disabled(frozen != nil || target == nil)
-            } else if effective == .midpoint {
-                Text("点选同一多重峰两端的对称谱线，以中点定标。")
-            } else if effective == .freeClick { Text("按点击位置取 ppm。") }
-            else { Text("橙色圆环表示已吸附峰顶，点一下预览偏移。") }
-        }
-    }
-    private var confirmation: some View {
-        VStack(alignment: .leading) {
-            if let f = frozen, let p = pick {
-                let d = f.target.ppm - p.observedPPM
-                let bins = p.marks.compactMap { $0.peak }.map { "[\($0.first)…\($0.last)]" }.joined(separator: ", ")
-                Text("\(p.method.label) \(bins): \(String(p.observedPPM)) → \(String(f.target.ppm)) ppm (\(f.target.material), \(f.target.site)). Add Δ \(nrSigned(d)) ppm.")
-                if !f.target.review.isEmpty { Toggle(f.target.review, isOn: $acknowledged) }
-                Button("应用定标") { apply() }.disabled(f.scope != scope || !d.isFinite || !(scope.offsetPPM + d).isFinite || (!f.target.review.isEmpty && !acknowledged))
+        VStack(alignment: .leading, spacing: 12) {
+            choiceMenu("取点方式", value: effective.label) {
+                ForEach(NRMethod.allCases.filter { target?.permits($0) != false }, id: \.self) { m in
+                    choiceItem(m.label, selected: effective == m) { method = m }
+                }
             }
-            if frozen != nil { Button("重新选点") { clearPick(); message = "" } }
+            .disabled(frozen != nil)
+            if effective == .typed {
+                VStack(alignment: .leading, spacing: 10) {
+                    entryField("实测 ppm（当前坐标）", text: $measuredText, prompt: "输入当前坐标上的 ppm")
+                    Button(action: stageTyped) {
+                        Text("预览偏移").frame(maxWidth: .infinity, minHeight: 36)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .disabled(frozen != nil || target == nil)
+            } else if effective == .midpoint {
+                note("点选同一多重峰两端的对称谱线，以中点定标。")
+            } else if effective == .freeClick {
+                note("按点击位置取 ppm，不吸附峰顶。")
+            } else {
+                note("青色圆环与实心点表示已吸附峰顶，点击预览偏移。")
+            }
         }
     }
+
+    private var delta: Double? {
+        guard let f = frozen, let p = pick else { return nil }
+        return f.target.ppm - p.observedPPM
+    }
+
+    private var canApply: Bool {
+        guard isReferencing, let f = frozen, let d = delta else { return false }
+        return f.scope == scope && d.isFinite && (scope.offsetPPM + d).isFinite &&
+            (f.target.review.isEmpty || acknowledged)
+    }
+
+    private func readout(_ title: String, value: Double?, signed: Bool = false) -> some View {
+        let text = value.flatMap { v in
+            v.isFinite ? String(format: signed ? "%+.8g" : "%.8g", locale: Locale.current, v) : nil
+        } ?? "—"
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title).font(.system(size: 17)).foregroundColor(colors.secondary)
+            Spacer(minLength: 8)
+                Text(text)
+                    .font(.system(size: 22, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundColor(signed && value?.isFinite == true ? colors.accent : colors.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .textSelection(.enabled)
+                if value?.isFinite == true {
+                    Text("ppm").font(.system(size: 15)).foregroundColor(colors.secondary)
+                }
+        }
+        .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var confirmation: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            readout("目标位移", value: target?.ppm)
+            readout("实测位置", value: pick?.observedPPM)
+            readout("校正偏移", value: delta, signed: true)
+            if let f = frozen, pick != nil, !f.target.review.isEmpty {
+                Toggle(f.target.review, isOn: $acknowledged)
+                    .toggleStyle(.checkbox)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(minHeight: 36, alignment: .leading)
+            }
+            Button(action: apply) {
+                Text("应用定标")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(colorScheme == .dark ? colors.background : .white)
+                    .frame(maxWidth: .infinity, minHeight: 44)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!canApply)
+            if frozen != nil {
+                note("参考已锁定；重新选点可更改。")
+                Button {
+                    clearPick(); message = ""
+                } label: {
+                    Text("重新选点").frame(maxWidth: .infinity, minHeight: 36)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    private var sidebar: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("溶剂参考").font(.system(size: 24, weight: .semibold))
+                    if let nucleusControls {
+                        nucleusControls
+                            .font(.system(size: 17))
+                            .controlSize(.large)
+                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                            .disabled(frozen != nil)
+                    }
+                }
+                if isReferencing {
+                    Divider().overlay(colors.border)
+                    chooser
+                    Divider().overlay(colors.border)
+                    acquisition
+                    Divider().overlay(colors.border)
+                    confirmation
+                }
+                if !message.isEmpty {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "info.circle").foregroundColor(colors.accent)
+                        note(statusMessage).textSelection(.enabled)
+                    }
+                }
+                Divider().overlay(colors.border)
+                HStack(spacing: 10) {
+                    Button(action: undo) {
+                        Text("撤销上次定标").frame(maxWidth: .infinity, minHeight: 36)
+                    }
+                    .disabled(undoableID == nil)
+                    Button {
+                        isReferencing.toggle()
+                    } label: {
+                        Text(isReferencing ? "退出参考" : "开始选参考峰")
+                            .frame(maxWidth: .infinity, minHeight: 36)
+                    }
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .frame(width: StudioColors.sidebarWidth)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .background(colors.panel)
+        .font(.system(size: 17))
+        .foregroundColor(colors.text)
+        .controlSize(.large)
+        .tint(colors.accent)
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+            if let plotHeader { plotHeader; Divider() }
+            // Keep the tracking geometry attached to the plot child itself,
+            // before the expanding frame and never to the surrounding HStack.
             plot().overlay {
                 if isReferencing {
                     NRSurface(index: index, radii: radii, offset: scope.offsetPPM, makeMap: map, live: pick == nil && effective != .typed, snap: effective != .freeClick, marks: pick?.marks ?? first.map { [$0] } ?? [], measured: pick?.observedPPM, clicked: click)
                 }
             }
-            HStack { Toggle("正在选参考峰", isOn: $isReferencing); Spacer(); Button("撤销上次定标") { undo() }.disabled(undoableID == nil) }
-            if isReferencing { chooser; acquisition; confirmation }
-            if !message.isEmpty { Text(message).font(.callout).textSelection(.enabled) }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider().overlay(colors.border)
+            sidebar
         }
+        .background(colors.background)
         .onChange(of: scope) { _ in
             let hadPick = frozen != nil; clearPick(); measuredText = ""
             if hadPick { message = "Spectrum or axis changed; staged pick discarded." } else { message = "" }

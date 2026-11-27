@@ -28,7 +28,8 @@ extension Workbench {
     }
 
     // Both export and screen call this builder. Only the screen supplies a selection.
-    func annotationPlot(selecting id: UUID?) -> PlotState {
+    func annotationPlot(selecting id: UUID?,
+                        trial: (id: UUID, bounds: ClosedRange<Double>)? = nil) -> PlotState {
         let offset = displayOffset
         let delta = offset - applied.offset
         let visible = (window.lowerBound + delta)...(window.upperBound + delta)
@@ -55,18 +56,30 @@ extension Workbench {
             }
         }
 
+        // Trial bounds are on the applied axis; this override never changes host data.
+        func measuredBounds(_ mark: Mark) -> ClosedRange<Double> {
+            if let trial, trial.id == mark.id, !mark.isPeak,
+               trial.bounds.lowerBound.isFinite, trial.bounds.upperBound.isFinite,
+               trial.bounds.lowerBound < trial.bounds.upperBound {
+                return trial.bounds
+            }
+            return bounds(mark)
+        }
+
         // Areas always come from the applied, unamplified spectrum. Integrate
         // the anchor once, not once per bracket. Reuse the journal's signed math.
         let anchor: (area: Double, target: Double)? = reference.flatMap { ref in
             guard let m = marks.first(where: { $0.id == ref.markID && $0.lo < $0.hi }) else {
                 return nil
             }
-            return (spectrum.area(bounds(m)), ref.target)
+            return (spectrum.area(measuredBounds(m)), ref.target)
         }
 
         for mark in marks {
-            let lo = mark.lo + offset
-            let hi = mark.hi + offset
+            let measurement = measuredBounds(mark)
+            let isTrial = trial?.id == mark.id && !mark.isPeak
+            let lo = isTrial ? measurement.lowerBound + delta : mark.lo + offset
+            let hi = isTrial ? measurement.upperBound + delta : mark.hi + offset
             guard lo.isFinite, hi.isFinite, lo <= hi else { continue }
 
             if mark.isPeak {
@@ -75,7 +88,7 @@ extension Workbench {
                 if mark.id == id { result.selectedPeak = fitted ?? lo }
             } else {
                 let band = lo...hi
-                let area = spectrum.area(bounds(mark))
+                let area = spectrum.area(measurement)
                 let relative = anchor.flatMap {
                     SessionJournal.relativeArea(area, referenceArea: $0.area, target: $0.target)
                 }
@@ -89,7 +102,10 @@ extension Workbench {
                 result.bands.append(band)
                 result.bandIDs.append(mark.id)
                 result.bandLabels.append(label)
-                if mark.id == id { result.selectedBand = band }
+                if mark.id == id {
+                    result.selectedBand = band
+                    result.selectedBandID = mark.id
+                }
             }
         }
 
@@ -160,7 +176,7 @@ struct StudioAnnotationBar: View {
                     }
                     Button("编辑积分…") { edit(mark) }
                         .keyboardShortcut("i", modifiers: [.command, .option])
-                        .help("编辑边界、设置或取消参考积分")
+                        .help("可直接拖动谱图括线两端调整边界；Esc 取消。此处可设置参考积分。")
                 }
                 Button { remove(mark) } label: { Image(systemName: "trash") }
                     .keyboardShortcut(.delete, modifiers: .command)
@@ -169,7 +185,7 @@ struct StudioAnnotationBar: View {
             } else if w.marks.contains(where: \.isPeak) {
                 Text("可在此选择积分或旧峰标。").foregroundStyle(.secondary).lineLimit(1)
             } else {
-                Text("点选谱图括线可编辑积分。").foregroundStyle(.secondary).lineLimit(1)
+                Text("点选积分；拖动括线端点调整范围。").foregroundStyle(.secondary).lineLimit(1)
             }
 
             Spacer(minLength: 4)

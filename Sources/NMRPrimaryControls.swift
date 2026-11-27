@@ -8,37 +8,37 @@ public enum NMRSimpleTool: String, CaseIterable, Hashable, Identifiable, Sendabl
 
     public var title: String {
         switch self {
-        case .zoom:             return "缩放"
+        case .zoom: return "缩放"
         case .solventReference: return "溶剂参考"
-        case .integral:         return "积分"
-        case .markPeaks:        return "标峰"
+        case .integral: return "积分"
+        case .markPeaks: return "标峰"
         }
     }
 
     public var hint: String {
         switch self {
-        case .zoom:             return "横向拖选要放大的范围，按 ⌘0 恢复全谱。"
-        case .solventReference: return "点选可见的溶剂峰，检查吸附位置后确认参考值。"
-        case .integral:         return "横向拖选积分区间；点选下方括线可编辑该积分。"
-        case .markPeaks:        return "框选 ppm 和强度范围。可连续标峰，再打开峰组审阅。"
+        case .zoom: return "拖选放大，⌘0 恢复全谱。"
+        case .solventReference: return "点选溶剂峰并确认参考值。"
+        case .integral: return "拖选区间；点选括线，拖动端点。"
+        case .markPeaks: return "框选峰组，可连续标峰后审阅。"
         }
     }
 
     fileprivate var symbol: String {
         switch self {
-        case .zoom:             return "magnifyingglass"
+        case .zoom: return "magnifyingglass"
         case .solventReference: return "scope"
-        case .integral:         return "sum"
-        case .markPeaks:        return "pencil.tip"
+        case .integral: return "sum"
+        case .markPeaks: return "pencil.tip"
         }
     }
 
     fileprivate var key: Character {
         switch self {
-        case .zoom:             return "1"
+        case .zoom: return "1"
         case .solventReference: return "2"
-        case .integral:         return "3"
-        case .markPeaks:        return "4"
+        case .integral: return "3"
+        case .markPeaks: return "4"
         }
     }
 }
@@ -60,10 +60,10 @@ public struct NMRToolCallbacks<Scope> {
 
     @MainActor fileprivate func activate(_ tool: NMRSimpleTool, in scope: Scope) {
         switch tool {
-        case .zoom:             zoom(scope)
+        case .zoom: zoom(scope)
         case .solventReference: solventReference(scope)
-        case .integral:         integral(scope)
-        case .markPeaks:        markPeaks(scope)
+        case .integral: integral(scope)
+        case .markPeaks: markPeaks(scope)
         }
     }
 }
@@ -80,18 +80,70 @@ public struct NMRPrimaryExportItem<Scope>: Identifiable {
     }
 }
 
-private struct StudioPrimaryLabelStyle: LabelStyle {
+private struct StudioToolbarFace: View {
+    let title: String
+    let symbol: String
+    let width: CGFloat
+    var menu = false
+
+    var body: some View {
+        VStack(spacing: 7) {
+            Image(systemName: symbol)
+                .font(.system(size: 24, weight: .medium))
+                .frame(height: 28)
+            HStack(spacing: 4) {
+                Text(title).font(.system(size: 17, weight: .medium))
+                if menu {
+                    Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
+                }
+            }
+            .lineLimit(1)
+            .fixedSize()
+        }
+        .frame(width: width, height: 76)
+        .contentShape(RoundedRectangle(cornerRadius: 9))
+    }
+}
+
+private struct StudioToolbarSurface: ViewModifier {
+    var selected = false
+    var pressed = false
+    @State private var hovered = false
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.isEnabled) private var enabled
+
+    func body(content: Content) -> some View {
+        let colors = StudioColors(dark: colorScheme == .dark)
+        return content
+            .foregroundStyle(selected ? colors.accent : colors.text)
+            .background {
+                RoundedRectangle(cornerRadius: 9)
+                    .fill(selected ? colors.selection : (hovered || pressed ? colors.raised : Color.clear))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 9)
+                    .strokeBorder(selected ? colors.accent.opacity(0.65) :
+                                    (hovered ? colors.border : Color.clear), lineWidth: 1)
+            }
+            .opacity(enabled ? (pressed ? 0.75 : 1) : 0.42)
+            .onHover { hovered = $0 }
+            .animation(.easeOut(duration: 0.12), value: hovered)
+            .animation(.easeOut(duration: 0.12), value: selected)
+    }
+}
+
+private struct StudioToolbarButtonStyle: ButtonStyle {
+    var selected = false
     func makeBody(configuration: Configuration) -> some View {
-        Label(configuration)
-            .labelStyle(.titleAndIcon)
-            .font(.system(size: 14))
-            .padding(.vertical, 1)
+        configuration.label.modifier(StudioToolbarSurface(selected: selected, pressed: configuration.isPressed))
     }
 }
 
 @MainActor
 public struct NMRPrimaryControls<Scope, Workspace: View>: View {
     @Binding private var tool: NMRSimpleTool
+    @State private var showingExports = false
+    @Environment(\.colorScheme) private var colorScheme
     private let hasDocument: Bool
     private let status: String
     private let isBusy: Bool
@@ -122,114 +174,127 @@ public struct NMRPrimaryControls<Scope, Workspace: View>: View {
         self.workspace = workspace
     }
 
-    private var files: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("文件").font(.callout.weight(.semibold)).foregroundStyle(.secondary)
-            HStack(spacing: 5) {
-                // ⌘O / ⌘S belong to the scene commands; don't register duplicates here.
-                Button(action: openDocument) { Label("打开", systemImage: "folder") }
-                    .help("打开谱图或工程（⌘O）")
-                Button {
-                    if let scope = liveScope() { saveDocument(scope) }
-                } label: {
-                    Label("保存", systemImage: "square.and.arrow.down")
-                }
-                .disabled(!hasDocument)
-                .help("保存工程（⌘S）")
-
-                Menu {
-                    ForEach(existingExports) { item in
-                        Button(item.title) {
-                            if let scope = liveScope() { item.perform(scope) }
-                        }
-                    }
-                } label: {
-                    Label("导出", systemImage: "square.and.arrow.up")
-                }
-                .fixedSize()
-                .disabled(!hasDocument || existingExports.isEmpty)
-                .help("选择谱图数据或图像的导出格式")
-
-                Button {
-                    if let scope = liveScope() { professionalText(scope) }
-                } label: {
-                    Label("专业 TXT…", systemImage: "doc.plaintext")
-                }
-                .disabled(!hasDocument)
-                .keyboardShortcut("t", modifiers: [.command, .shift])
-                .help("编排并导出专业谱图文本")
+    private func files(width: CGFloat) -> some View {
+        HStack(spacing: 4) {
+            // Scene commands own ⌘O and ⌘S; don't register duplicate shortcuts.
+            Button(action: openDocument) {
+                StudioToolbarFace(title: "打开", symbol: "folder", width: width)
             }
-        }
-    }
+            .help("打开谱图或工程（⌘O）")
+            .accessibilityLabel("打开")
 
-    private var toolBank: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("谱图工具   ⌘1–4").font(.callout.weight(.semibold)).foregroundStyle(.secondary)
-            HStack(spacing: 5) {
-                ForEach(NMRSimpleTool.allCases) { item in
-                    Toggle(isOn: Binding(
-                        get: { tool == item },
-                        set: { on in
-                            guard on, let scope = liveScope() else { return }
-                            tool = item
-                            tools.activate(item, in: scope)
-                        }
-                    )) {
-                        Label(item.title, systemImage: item.symbol)
-                    }
-                    .toggleStyle(.button)
-                    .keyboardShortcut(KeyEquivalent(item.key), modifiers: .command)
-                    .help("\(item.title)（⌘\(item.key)）\n\(item.hint)")
-                    .accessibilityLabel(Text(item.title))
-                    .accessibilityValue(Text(tool == item ? "已选定" : "未选定"))
-                    .accessibilityHint(Text(item.hint))
-                }
+            Button {
+                if let scope = liveScope() { saveDocument(scope) }
+            } label: {
+                StudioToolbarFace(title: "保存", symbol: "square.and.arrow.down", width: width)
             }
             .disabled(!hasDocument)
+            .help("保存工程（⌘S）")
+            .accessibilityLabel("保存")
+
+            Button { showingExports.toggle() } label: {
+                StudioToolbarFace(title: "导出", symbol: "square.and.arrow.up", width: width, menu: true)
+            }
+            .popover(isPresented: $showingExports, arrowEdge: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(existingExports) { item in
+                        Button {
+                            showingExports = false
+                            if let scope = liveScope() { item.perform(scope) }
+                        } label: {
+                            Text(item.title)
+                                .font(.system(size: 17))
+                                .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(14).frame(width: 250)
+                .studioTheme()
+            }
+            .disabled(!hasDocument || existingExports.isEmpty)
+            .help("导出谱图数据或图像")
+            .accessibilityLabel("导出")
+
+            Button {
+                if let scope = liveScope() { professionalText(scope) }
+            } label: {
+                StudioToolbarFace(title: "专业TXT", symbol: "doc.plaintext", width: width)
+            }
+            .disabled(!hasDocument)
+            .keyboardShortcut("t", modifiers: [.command, .shift])
+            .help("专业文本报表（⇧⌘T）")
+            .accessibilityLabel("专业 TXT")
         }
+        .buttonStyle(StudioToolbarButtonStyle())
+        .disabled(isBusy)
+    }
+
+    private func toolBank(width: CGFloat) -> some View {
+        HStack(spacing: 4) {
+            ForEach(NMRSimpleTool.allCases) { item in
+                Button {
+                    guard let scope = liveScope() else { return }
+                    tool = item
+                    tools.activate(item, in: scope)
+                } label: {
+                    StudioToolbarFace(title: item.title, symbol: item.symbol, width: width)
+                }
+                .buttonStyle(StudioToolbarButtonStyle(selected: tool == item))
+                .keyboardShortcut(KeyEquivalent(item.key), modifiers: .command)
+                .help("\(item.title)（⌘\(item.key)）· \(item.hint)")
+                .accessibilityLabel(Text(item.title))
+                .accessibilityValue(Text(tool == item ? "已选定" : "未选定"))
+                .accessibilityHint(Text(item.hint))
+            }
+        }
+        .disabled(!hasDocument || isBusy)
     }
 
     public var body: some View {
         GeometryReader { proxy in
-            let narrow = proxy.size.width < 880
-            let layout = narrow
-                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 6))
-                : AnyLayout(HStackLayout(alignment: .center, spacing: 14))
+            let colors = StudioColors(dark: colorScheme == .dark)
+            let width = min(CGFloat(110), max(CGFloat(82), (proxy.size.width - 192) / 8))
             VStack(spacing: 0) {
-                layout {
-                    files
-                    if !narrow { Divider().frame(height: 33) }
-                    toolBank
+                HStack(spacing: 0) {
+                    files(width: width)
+                    Divider().frame(height: 52).padding(.horizontal, 14)
+                    toolBank(width: width)
+                    Spacer(minLength: 12)
+                    StudioAppearanceMenu().frame(width: 92)
                 }
-                .labelStyle(StudioPrimaryLabelStyle())
-                .controlSize(.regular)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
-                .disabled(isBusy)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(colors.panel)
 
-                Divider()
+                Rectangle().fill(colors.border).frame(height: 1)
                 workspace(tool)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .disabled(isBusy)
-                Divider()
+                Rectangle().fill(colors.border).frame(height: 1)
 
                 let line = status.isEmpty ? (hasDocument ? "就绪" : "未载入谱图") : status
-                HStack(spacing: 7) {
+                HStack(spacing: 10) {
                     if isBusy {
                         ProgressView().controlSize(.small).accessibilityHidden(true)
                     }
                     Text(line).lineLimit(1).truncationMode(.tail)
-                    Spacer(minLength: 0)
+                        .help(line).layoutPriority(1)
+                    Spacer(minLength: 12)
+                    if hasDocument && !isBusy {
+                        Text(tool.hint).lineLimit(1).help(tool.hint)
+                    }
                 }
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 4)
-                .help(line)
+                .font(.system(size: 15))
+                .foregroundStyle(colors.secondary)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(colors.panel)
                 .accessibilityElement(children: .combine)
             }
-            .background(Color(nsColor: .windowBackgroundColor))
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .background(colors.background)
         }
     }
 }

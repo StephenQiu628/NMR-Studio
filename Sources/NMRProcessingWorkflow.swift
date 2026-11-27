@@ -113,10 +113,10 @@ public enum NMRBaselineReason: String, Codable, Equatable, Sendable {
         case .short: return "点数太少"
         case .grid: return "谱轴不是近似等间隔的单调轴"
         case .weak: return "偏置、漂移或谱峰的证据不足"
-        case .floorBelowThreshold: return "候选直线基线低于扣除阈值"
+        case .floorBelowThreshold: return "峰间背景接近零，偏置和漂移均低于扣除阈值"
         case .noPositiveSignal: return "未找到足以支持扣除基线的连续正信号"
-        case .noFloor: return "没有横跨谱区且相互一致的背景区块"
-        case .negative: return "候选直线下方有明显负信号"
+        case .noFloor: return "背景支持不足，或无法可靠区分漂移与谱带"
+        case .negative: return "候选基线下方有明显负信号"
         case .range: return "强度超出可安全拟合的范围"
         }
     }
@@ -127,6 +127,7 @@ public enum NMRAutoDecision: Codable, Equatable, Sendable {
     case skipped(NMRBaselineReason)
     // 两端强度（不是 ppm）；线性模型仅有两个自由度。
     case affine(first: Double, last: Double, anchors: Int, blocks: Int)
+    case smoothV1(NMRSmoothCurveV1)
 }
 public struct NMRBaselineReceipt: Codable, Equatable, Sendable {
     public let count: Int
@@ -137,13 +138,34 @@ public struct NMRBaselineReceipt: Codable, Equatable, Sendable {
         self.decision = decision
     }
 
-    // Retain the V1 decision for older readers. The optional detail only explains a skipped correction.
+    // One application kernel for import, new processing and recorded decisions.
+    func applying(to real: [Double]) throws -> [Double] {
+        guard count == real.count, count > 0, count <= NMRProcessingWorkflow.maxPoints else { throw NMRProcessingError.receipt }
+        let result: [Double]
+        switch decision {
+        case .skipped: result = real
+        case let .affine(l, r, k, m):
+            guard count >= 2, l.isFinite, r.isFinite, k >= 2, k <= m, m <= 48 else { throw NMRProcessingError.receipt }
+            result = NMRProcessingWorkflow.subtractLine(real, l, r)
+        case let .smoothV1(curve):
+            guard curve.matches(count: count) else { throw NMRProcessingError.receipt }
+            let den = Double(count - 1)
+            result = real.indices.map { real[$0] - NMRSmoothCurveV1.value(curve.knots, Double($0) / den) }
+        }
+        guard result.allSatisfy({ $0.isFinite }) else { throw NMRProcessingError.numbers }
+        return result
+    }
+
+    // Keep the existing wire representation for affine and all skip reasons.
     private enum CodingKeys: String, CodingKey { case count, decision, weakDetail }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         count = try container.decode(Int.self, forKey: .count)
         let original = try container.decode(NMRAutoDecision.self, forKey: .decision)
+        if case let .smoothV1(curve) = original, !curve.matches(count: count) {
+            throw DecodingError.dataCorruptedError(forKey: .count, in: container, debugDescription: "平滑基线与谱点数不匹配")
+        }
         if original == .skipped(.weak),
            let detail = try container.decodeIfPresent(String.self, forKey: .weakDetail),
            let reason = NMRBaselineReason(rawValue: detail), reason.refinesWeak {
@@ -172,6 +194,7 @@ public enum NMRBaselineStatus: Equatable {
         case .legacyEndpoints: return "已扣除端点直线基线"
         case let .automatic(.skipped(why)): return "未扣除自动基线：" + why.title
         case let .automatic(.affine(_, _, k, m)): return "已扣除自动直线基线（支持区块 \(k)/\(m)）"
+        case let .automatic(.smoothV1(c)): return "已扣除 Whittaker 平滑基线（背景区块 \(c.anchors)/\(c.blocks)）"
         }
     }
 }
@@ -317,6 +340,8 @@ enum NMRFloor {
     static func decide(_ a: NMRArrays) -> NMRAutoDecision {
         let v = a.real, n = v.count
         guard n >= 192 else { return .skipped(.short) }
+        guard n <= NMRProcessingWorkflow.maxPoints, v.allSatisfy({ $0.isFinite }) else { return .skipped(.range) }
+        guard a.ppm.count == n else { return .skipped(.grid) }
         let h = (a.ppm[n - 1] - a.ppm[0]) / Double(n - 1)
         guard h.isFinite, h != 0 else { return .skipped(.grid) }
         for j in 1..<n {
@@ -366,7 +391,7 @@ enum NMRFloor {
                 }
             }
         }
-        guard !best.isEmpty else { return .skipped(.noFloor) }
+        guard !best.isEmpty else { return SmoothBaseline.decide(v, scale: z, noise: sigma) }
         // 仅在共识锚上细化一次，不迭代扩大锚区。
         let mx = best.reduce(0.0) { $0 + bins[$1].x } / Double(best.count)
         let my = best.reduce(0.0) { $0 + bins[$1].m } / Double(best.count)
@@ -473,17 +498,12 @@ public enum NMRProcessingWorkflow {
             do { out.real = try legacy(out) } catch { throw NMRProcessingError.endpointsFailed(error) }
             s.automaticBaselineV1 = nil; status = .legacyEndpoints
         case .automatic:
-            let d: NMRAutoDecision
-            if action == .replay, let saved = s.automaticBaselineV1 {
-                guard saved.count == out.real.count else { throw NMRProcessingError.receipt }
-                d = saved.decision
-            } else { d = NMRFloor.decide(out) }
-            if case let .affine(l, r, k, m) = d {
-                guard out.real.count >= 2, l.isFinite, r.isFinite, k >= 2, k <= m, m <= 48 else { throw NMRProcessingError.receipt }
-                out.real = subtractLine(out.real, l, r)
-            }
-            s.automaticBaselineV1 = NMRBaselineReceipt(count: out.real.count, decision: d)
-            status = .automatic(d)
+            let receipt: NMRBaselineReceipt
+            if action == .replay, let saved = s.automaticBaselineV1 { receipt = saved }
+            else { receipt = NMRBaselineReceipt(count: out.real.count, decision: NMRFloor.decide(out)) }
+            out.real = try receipt.applying(to: out.real)
+            s.automaticBaselineV1 = receipt
+            status = .automatic(receipt.decision)
         }
         guard out.real.count == fft.real.count, out.real.allSatisfy({ $0.isFinite }) else { throw NMRProcessingError.arrays }
         if s.offset != 0 {

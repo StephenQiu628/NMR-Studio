@@ -15,7 +15,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
     @StateObject private var w = Workbench()
     var body: some Scene {
         Window("NMR Studio",id:"spectrum") { StudioView(w:w).background(WindowMonitor(w:w)).onAppear { delegate.workbench=w } }
-            .defaultSize(width:1140,height:710)
+            .defaultSize(width:1280,height:820)
             .commands {
                 CommandGroup(after:.undoRedo) {
                     Button("撤销上一步谱图操作") { w.undo() }.keyboardShortcut("z",modifiers:[.command,.option])
