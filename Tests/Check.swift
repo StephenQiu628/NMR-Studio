@@ -62,8 +62,11 @@ import PDFKit
         }
     }
     @MainActor static func main() throws {
+        try IntegralDragCheck.run()
         try textReportChecks()
         try floorDiagnostics()
+        try ProcessingRegression.checkRegionalPhase()
+        try ProcessingRegression.checkCurvedBaseline()
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at:tmp,withIntermediateDirectories:true)
         defer { try? FileManager.default.removeItem(at:tmp) }
